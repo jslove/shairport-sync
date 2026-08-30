@@ -50,6 +50,7 @@
 
 #include <avahi-client/lookup.h>
 #include <avahi-common/alternative.h>
+#include <avahi-common/address.h>
 
 void threaded_poll_unlock(void *arg) { avahi_threaded_poll_unlock((AvahiThreadedPoll *)arg); }
 
@@ -272,18 +273,81 @@ static void register_service(AvahiClient *c) {
       selected_interface = config.interface_index;
     else
       selected_interface = AVAHI_IF_UNSPEC;
+
+    // If general.interface names a specific network interface, publish this
+    // instance's AirPlay service(s) against a hostname distinct from the
+    // system's default hostname, bound to that interface's own address.
+    // Without this, avahi_entry_group_add_service_strlst() with host=NULL
+    // always advertises the SRV record against the system hostname (e.g.
+    // "rpi3-airplay1.local"), so every shairport-sync instance on one host
+    // -- regardless of which interface/IP it's bound to -- resolves to the
+    // same address, breaking multi-instance-per-host setups (e.g. via
+    // macvlan): clients can discover distinct service names, but every one
+    // of them resolves back to the same host/IP.
+    char instance_hostname[256];
+    const char *host_to_use = NULL; // NULL => default Avahi behavior, unchanged
+    char resolved_ip[INET6_ADDRSTRLEN];
+    int resolved_family;
+    if (config.interface != NULL &&
+        resolve_interface_to_address(resolved_ip, sizeof(resolved_ip), &resolved_family) == 0) {
+      // Use the interface name alone (not config.service_name, which is a
+      // free-form display string that may contain spaces or other
+      // characters not valid in a hostname) plus the device's own MAC-based
+      // hostname prefix, to build a hostname that is both interface-specific
+      // and reasonably unique on the network.
+      snprintf(instance_hostname, sizeof(instance_hostname), "shairport-%s.local", config.interface);
+      AvahiAddress addr;
+      memset(&addr, 0, sizeof(addr));
+      if (avahi_address_parse(resolved_ip, resolved_family == AF_INET6 ? AVAHI_PROTO_INET6
+                                                                        : AVAHI_PROTO_INET,
+                               &addr) != NULL) {
+        // The Avahi daemon already auto-publishes an address record mapping
+        // this same IP to the system's default hostname (e.g.
+        // "rpi3-airplay1.local"). Publishing a second hostname for the same
+        // address is not itself a collision as far as Avahi's API is
+        // concerned; AVAHI_PUBLISH_NO_REVERSE is passed because we only need
+        // forward (A/AAAA) resolution for this hostname, not a PTR record --
+        // requesting a reverse mapping here would collide with the PTR
+        // record the daemon already publishes for the system hostname.
+        // (AVAHI_PUBLISH_ALLOW_MULTIPLE was also tried, expecting it to be
+        // needed for the shared-address case above, but the Avahi client
+        // library rejects it here with AVAHI_ERR_INVALID_FLAGS (-29) --
+        // it is only accepted by the lower-level avahi_entry_group_add_record()
+        // API, not avahi_entry_group_add_address(). NO_REVERSE alone is
+        // sufficient and was confirmed working.)
+        int aret = avahi_entry_group_add_address(
+            group, selected_interface,
+            resolved_family == AF_INET6 ? AVAHI_PROTO_INET6 : AVAHI_PROTO_INET,
+            AVAHI_PUBLISH_NO_REVERSE, instance_hostname, &addr);
+        if (aret == 0) {
+          host_to_use = instance_hostname;
+          debug(1, "avahi: published distinct hostname \"%s\" -> \"%s\" for interface \"%s\".",
+                instance_hostname, resolved_ip, config.interface);
+        } else {
+          debug(1,
+                "avahi: avahi_entry_group_add_address failed (%d) for hostname \"%s\" -- "
+                "falling back to default host advertisement.",
+                aret, instance_hostname);
+        }
+      } else {
+        debug(1, "avahi: avahi_address_parse failed for \"%s\" -- falling back to default host "
+                 "advertisement.",
+              resolved_ip);
+      }
+    }
+
     if (ap2_text_record_string_list) {
       ret = avahi_entry_group_add_service_strlst(group, selected_interface, AVAHI_PROTO_UNSPEC, 0,
-                                                 ap2_service_name, config.regtype2, NULL, NULL,
-                                                 port, ap2_text_record_string_list);
+                                                 ap2_service_name, config.regtype2, NULL,
+                                                 host_to_use, port, ap2_text_record_string_list);
       if (ret == AVAHI_ERR_COLLISION) {
         die("Error: AirPlay 2 name \"%s\" is already in use.", ap2_service_name);
       }
     }
     if ((ret == 0) && (text_record_string_list)) {
       ret = avahi_entry_group_add_service_strlst(group, selected_interface, AVAHI_PROTO_UNSPEC, 0,
-                                                 service_name, config.regtype, NULL, NULL, port,
-                                                 text_record_string_list);
+                                                 service_name, config.regtype, NULL, host_to_use,
+                                                 port, text_record_string_list);
       if (ret == AVAHI_ERR_COLLISION) {
         die("Error: AirPlay 1 name \"%s\" is already in use.", service_name);
       }
